@@ -2,6 +2,7 @@
 import json
 import math
 from enum import StrEnum
+from types import SimpleNamespace
 
 from pymavlink import mavutil
 
@@ -29,6 +30,15 @@ def valid_point(lat, lon):
             and -90 <= lat <= 90 and -180 <= lon <= 180)
 
 
+# At most one independent observation per type and reception timestamp.
+FIELDS = {
+    "HEARTBEAT": ("type", "autopilot", "base_mode", "custom_mode"),
+    "GPS_RAW_INT": ("fix_type", "satellites_visible", "eph"),
+    "EKF_STATUS_REPORT": ("flags",),
+    "GLOBAL_POSITION_INT": ("time_boot_ms", "lat", "lon", "vx", "vy"),
+}
+
+
 class Trial:
     def __init__(self, trial_id, lat, lon):
         if not isinstance(trial_id, str) or not trial_id.strip() or not valid_point(lat, lon):
@@ -42,6 +52,9 @@ class Trial:
         self.request = self.reason = None
         self.window = []
         self.rows = []
+        self._pending_at = None
+        self._messages = {}
+        self._actions = set()
 
     @property
     def target(self):
@@ -99,34 +112,101 @@ class Trial:
             self.transition(State.ABORT, "navigation health lost")
         return self.state != State.ABORT
 
-    def poll(self, at):
-        if self.advance(at):
+    def _queue(self, at):
+        if self.state == State.ABORT:
+            return False
+        if (type(at) not in (int, float) or not math.isfinite(at) or at < 0
+                or (self.now is not None and at <= self.now)
+                or (self._pending_at is not None and at < self._pending_at)):
+            self._messages.clear()
+            self._actions.clear()
+            self._pending_at = None
+            self.transition(State.ABORT, "invalid or already closed event time")
+            return False
+        if self._pending_at is not None and at > self._pending_at:
+            self.close_timestamp()
+        if self.state in (State.ABORT, State.STOPPED):
+            return False
+        self._pending_at = at
+        return True
+
+    def close_timestamp(self):
+        """Seal the pending group after the producer has delivered all its events."""
+        at = self._pending_at
+        if at is None:
+            return
+        actions, messages = self._actions, self._messages
+        self._actions, self._messages, self._pending_at = set(), {}, None
+        if not self.advance(at, manual="manual" in actions):
+            return
+        if "invalid" in actions:
+            self.transition(State.ABORT, "missing or conflicting telemetry")
+            return
+        for kind in FIELDS:
+            if kind in messages:
+                fields = dict(zip(FIELDS[kind], messages[kind]))
+                if kind == "HEARTBEAT":
+                    fields["mode"] = messages[kind][-1]
+                self._observe(kind, SimpleNamespace(**fields), at)
+                if self.state == State.ABORT:
+                    return
+        if "permit" in actions and self.state == State.PERMISSION:
+            self.transition(State.VEHICLE)
+        if "poll" in actions:
             self.record("poll")
 
+    def poll(self, at):
+        if self._queue(at):
+            self._actions.add("poll")
+
     def permit(self, at):
-        if self.advance(at) and self.state == State.PERMISSION:
-            self.transition(State.VEHICLE)
+        if self._queue(at):
+            self._actions.add("permit")
 
     def manual_intervention(self, at):
-        self.advance(at, manual=True)
+        if self._queue(at):
+            self._actions.add("manual")
 
     def finish(self, at):
-        if self.advance(at):
+        if at != self.now or self._pending_at is not None:
+            self._queue(at)
+        self.close_timestamp()
+        if self.state not in (State.ABORT, State.STOPPED):
             self.transition(State.ABORT, "end of input before confirmed stop")
 
     def observe(self, msg, at, *, manual=False):
-        if not self.advance(at, manual):
+        if not self._queue(at):
             return
+        if manual:
+            self._actions.add("manual")
         if (msg.get_srcSystem(), msg.get_srcComponent()) != (BOAT_SYSID, BOAT_COMPID):
             return
         kind = msg.get_type()
+        if kind not in FIELDS:
+            return
+        values = tuple(getattr(msg, field, None) for field in FIELDS[kind])
+        required = values[:-2] if kind == "GLOBAL_POSITION_INT" else values
+        if any(type(value) is not int for value in required):
+            self._actions.add("invalid")
+            return
+        if kind == "GLOBAL_POSITION_INT" and not 0 <= values[0] <= 0xffffffff:
+            self._actions.add("invalid")
+            return
+        if kind == "HEARTBEAT" and values[:2] != (
+                mavutil.mavlink.MAV_TYPE_SURFACE_BOAT, mavutil.mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA):
+            return
+        if kind == "HEARTBEAT":
+            values += (mavutil.mode_string_v10(msg),)
+        if kind in self._messages and values != self._messages[kind]:
+            self._actions.add("invalid")
+        self._messages[kind] = values
+
+    def _observe(self, kind, msg, at):
         if kind == "HEARTBEAT":
             mav = mavutil.mavlink
-            if (msg.type, msg.autopilot) != (mav.MAV_TYPE_SURFACE_BOAT, mav.MAV_AUTOPILOT_ARDUPILOTMEGA):
-                return
             previous = self.mode
             self.heartbeat = at
-            self.mode = mavutil.mode_string_v10(msg)
+            self.mode = msg.mode
             self.armed = bool(msg.base_mode & mav.MAV_MODE_FLAG_SAFETY_ARMED)
             if self.state in (State.HEALTH, State.PERMISSION):
                 allowed = not self.armed and self.mode in SAFE_MODES and previous in (None, self.mode)
